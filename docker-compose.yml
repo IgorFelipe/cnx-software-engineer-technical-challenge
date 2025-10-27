@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: email-mailing-db
+    restart: unless-stopped
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: email_mailing
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - email-mailing-network
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: email-mailing-rabbitmq
+    restart: unless-stopped
+    ports:
+      - '5672:5672'      # AMQP protocol port
+      - '15672:15672'    # Management UI port
+    environment:
+      RABBITMQ_DEFAULT_USER: rabbitmq
+      RABBITMQ_DEFAULT_PASS: rabbitmq
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - email-mailing-network
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: email-mailing-api
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_mailing?schema=public
+      RABBITMQ_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
+      PORT: 3000
+      NODE_ENV: production
+      ENABLE_MX_CHECK: 'false'
+      ENABLE_DISPOSABLE_CHECK: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 3s
+      start_period: 40s
+      retries: 3
+    networks:
+      - email-mailing-network
+
+networks:
+  email-mailing-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  rabbitmq_data:
+    driver: local

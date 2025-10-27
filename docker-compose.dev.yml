@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: email-mailing-db-dev
+    restart: unless-stopped
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: email_mailing
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - email-mailing-network
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.dev
+    container_name: email-mailing-api-dev
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_mailing?schema=public
+      PORT: 3000
+      NODE_ENV: development
+    volumes:
+      - ./api/src:/app/src:ro
+      - ./api/prisma:/app/prisma:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - email-mailing-network
+
+networks:
+  email-mailing-network:
+    driver: bridge
+
+volumes:
+  postgres_data_dev:
+    driver: local

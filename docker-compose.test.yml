@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  # Test Database
+  db-test:
+    image: postgres:16
+    container_name: email-mailing-db-test
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: email_mailing_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+
+  # Test RabbitMQ
+  rabbitmq-test:
+    image: rabbitmq:3.13-management
+    container_name: email-mailing-rabbitmq-test
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    volumes:
+      - rabbitmq-test-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+    networks:
+      - test-network
+
+  # WireMock for API mocking
+  wiremock:
+    image: wiremock/wiremock:latest
+    container_name: email-mailing-wiremock
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./test/wiremock/mappings:/home/wiremock/mappings
+      - ./test/wiremock/__files:/home/wiremock/__files
+    command: ["--verbose", "--global-response-templating"]
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/__admin/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-test-data:
+  rabbitmq-test-data:
+
+networks:
+  test-network:
+    driver: bridge
