@@ -1,0 +1,159 @@
+{
+  "mappings": [
+    {
+      "id": "success-response",
+      "name": "Successful Email Send",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send",
+        "headers": {
+          "Content-Type": {
+            "contains": "application/json"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "jsonBody": {
+          "success": true,
+          "messageId": "{{randomValue length=32 type='ALPHANUMERIC'}}",
+          "timestamp": "{{now format='yyyy-MM-dd HH:mm:ss'}}"
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "delayDistribution": {
+          "type": "uniform",
+          "lower": 100,
+          "upper": 500
+        }
+      }
+    },
+    {
+      "id": "server-error-5xx",
+      "name": "Server Error (5xx)",
+      "priority": 2,
+      "scenarioName": "retry-scenario",
+      "requiredScenarioState": "Started",
+      "newScenarioState": "First Retry",
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send-with-retry"
+      },
+      "response": {
+        "status": 500,
+        "jsonBody": {
+          "error": "Internal Server Error",
+          "message": "Database connection failed",
+          "code": "DB_ERROR"
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "id": "server-error-second-attempt",
+      "name": "Server Error Second Attempt",
+      "priority": 2,
+      "scenarioName": "retry-scenario",
+      "requiredScenarioState": "First Retry",
+      "newScenarioState": "Second Retry",
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send-with-retry"
+      },
+      "response": {
+        "status": 503,
+        "jsonBody": {
+          "error": "Service Unavailable",
+          "message": "Service temporarily unavailable",
+          "code": "SERVICE_UNAVAILABLE"
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "id": "server-error-third-attempt",
+      "name": "Server Error Third Attempt (Final)",
+      "priority": 2,
+      "scenarioName": "retry-scenario",
+      "requiredScenarioState": "Second Retry",
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send-with-retry"
+      },
+      "response": {
+        "status": 502,
+        "jsonBody": {
+          "error": "Bad Gateway",
+          "message": "Upstream service failed",
+          "code": "BAD_GATEWAY"
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "id": "rate-limit-response",
+      "name": "Rate Limit (429)",
+      "priority": 3,
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send-rate-limited"
+      },
+      "response": {
+        "status": 429,
+        "jsonBody": {
+          "error": "Too Many Requests",
+          "message": "Rate limit exceeded. Please try again later.",
+          "retryAfter": 60
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "Retry-After": "60"
+        }
+      }
+    },
+    {
+      "id": "timeout-response",
+      "name": "Timeout Simulation",
+      "priority": 4,
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send-timeout"
+      },
+      "response": {
+        "status": 200,
+        "jsonBody": {
+          "success": true
+        },
+        "fixedDelayMilliseconds": 35000
+      }
+    },
+    {
+      "id": "client-error-4xx",
+      "name": "Client Error (4xx)",
+      "priority": 5,
+      "request": {
+        "method": "POST",
+        "urlPattern": "/emails/send-invalid"
+      },
+      "response": {
+        "status": 400,
+        "jsonBody": {
+          "error": "Bad Request",
+          "message": "Invalid email format",
+          "code": "VALIDATION_ERROR"
+        },
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    }
+  ]
+}
