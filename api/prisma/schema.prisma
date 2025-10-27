@@ -1,0 +1,128 @@
+// This is your Prisma schema file
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Tabela principal de entradas de mailing
+model MailingEntry {
+  id             String   @id @default(uuid()) @db.Uuid
+  mailingId      String   @map("mailing_id") @db.VarChar(255)
+  email          String   @db.VarChar(255)
+  token          String   @db.VarChar(255)
+  status         String   @default("PENDING") @db.VarChar(50) // PENDING|SENDING|SENT|FAILED|INVALID
+  attempts       Int      @default(0)
+  lastAttempt    DateTime? @map("last_attempt") @db.Timestamptz
+  externalId     String?  @map("external_id") @db.VarChar(255)
+  
+  // Validation fields
+  invalidReason  String?  @map("invalid_reason") @db.VarChar(50) // syntax|disposable|mx-fail
+  validationDetails String? @map("validation_details") @db.Text
+  
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Constraint de unicidade para idempotência
+  @@unique([mailingId, email], name: "unique_mailing_email")
+  @@index([mailingId])
+  @@index([status])
+  @@index([email])
+  @@index([invalidReason])
+  @@map("mailing_entries")
+}
+
+// Tabela de progresso de mailing
+model MailingProgress {
+  mailingId        String   @id @map("mailing_id") @db.VarChar(255)
+  totalRows        Int      @default(0) @map("total_rows")
+  processedRows    Int      @default(0) @map("processed_rows")
+  lastProcessedLine Int     @default(0) @map("last_processed_line")
+  status           String   @default("RUNNING") @db.VarChar(50) // RUNNING|PAUSED|COMPLETED|FAILED
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([status])
+  @@map("mailing_progress")
+}
+
+// Tabela de dead letters (emails que falharam após todas as tentativas)
+model DeadLetter {
+  id          String   @id @default(uuid()) @db.Uuid
+  mailingId   String   @map("mailing_id") @db.VarChar(255)
+  email       String   @db.VarChar(255)
+  reason      String   @db.Text
+  attempts    Int      @default(0)
+  lastError   String?  @map("last_error") @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@index([mailingId])
+  @@index([email])
+  @@map("dead_letters")
+}
+
+// Tabela de mailings (aprimorada para tracking de arquivos)
+model Mailing {
+  id              String   @id @default(uuid()) @db.Uuid
+  filename        String   @db.VarChar(255)
+  storageUrl      String?  @map("storage_url") @db.Text
+  status          String   @default("PENDING") @db.VarChar(50) // PENDING|QUEUED|PROCESSING|COMPLETED|FAILED
+  attempts        Int      @default(0)
+  lastAttempt     DateTime? @map("last_attempt") @db.Timestamptz
+  errorMessage    String?  @map("error_message") @db.Text
+  totalLines      Int?     @map("total_lines")
+  processedLines  Int      @default(0) @map("processed_lines")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relacionamentos
+  outboxMessages  OutboxMessage[]
+
+  @@unique([filename])
+  @@index([status])
+  @@index([createdAt])
+  @@map("mailings")
+}
+
+// Tabela de outbox messages (Outbox Pattern para atomicidade)
+model OutboxMessage {
+  id            String    @id @default(uuid()) @db.Uuid
+  mailingId     String    @map("mailing_id") @db.Uuid
+  targetQueue   String    @map("target_queue") @db.Text
+  payload       Json      @db.JsonB // JSON object
+  attempts      Int       @default(0)
+  published     Boolean   @default(false)
+  publishedAt   DateTime? @map("published_at") @db.Timestamptz
+  lastError     String?   @map("last_error") @db.Text
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  // Relacionamento
+  mailing       Mailing   @relation(fields: [mailingId], references: [id], onDelete: Cascade)
+
+  @@index([mailingId])
+  @@index([published])
+  @@index([targetQueue])
+  @@index([createdAt])
+  @@map("outbox_messages")
+}
+
+// Tabela de dead letters para outbox (mensagens que falharam após todas tentativas)
+model OutboxDeadLetter {
+  id          String   @id @default(uuid()) @db.Uuid
+  mailingId   String   @map("mailing_id") @db.Uuid
+  error       String   @db.Text
+  attempts    Int      @default(0)
+  payload     Json     @db.JsonB
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([mailingId])
+  @@index([createdAt])
+  @@map("outbox_dead_letters")
+}
