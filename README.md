@@ -78,11 +78,27 @@ cnx-software-engineer-technical-challenge/
 │   └── README.md                 # API documentation
 ├── docs/                         # Complete documentation
 │   ├── architecture.md           # System architecture
+│   ├── ROLLOUT_STRATEGY.md       # Incremental deployment guide
+│   ├── ROLLOUT_QUICKSTART.md     # Deployment quick reference
+│   ├── ROLLOUT_DIAGRAMS.md       # Visual deployment flows
 │   ├── API.md                    # REST API reference
 │   ├── TEST-PLAN.md              # Testing strategy
 │   ├── runbook.md                # Operations guide
 │   └── ... (14 documents total)
 ├── scripts/                      # Utility scripts
+│   ├── rollout/                  # Deployment scripts
+│   │   ├── 01-apply-migrations.ps1
+│   │   ├── 02-deploy-publisher.ps1
+│   │   ├── 03-sanity-test.ps1
+│   │   ├── 04-deploy-consumer-canary.ps1
+│   │   ├── 05-observe-canary.ps1
+│   │   ├── 06-backfill-outbox.ps1
+│   │   ├── 07-scale-consumers.ps1
+│   │   ├── rollback.ps1
+│   │   ├── collect-evidence.ps1  # Evidence collection
+│   │   └── README.md
+│   ├── production-smoke-test.ps1 # Production verification (cannot fail)
+│   ├── production-monitor.ps1    # Continuous monitoring
 │   ├── monitor-backfill.ps1      # Monitoring tools
 │   └── test-*.ps1                # Test automation
 ├── docker-compose.yml            # Production environment
@@ -96,6 +112,7 @@ cnx-software-engineer-technical-challenge/
 ### Prerequisites
 - Docker & Docker Compose
 - Node.js 20+ (for local development)
+- PowerShell 5.1+ (for production testing scripts)
 
 ### Running with Docker
 
@@ -114,6 +131,35 @@ curl -X POST http://localhost:3000/mailing \
 # Check progress (replace {mailingId} with response from upload)
 curl http://localhost:3000/mailing/{mailingId}
 ```
+
+### 🔍 Production Testing (Robust & Reliable)
+
+The system includes comprehensive production testing scripts that **cannot fail**:
+
+```powershell
+# Comprehensive smoke test (all components)
+cd scripts
+.\production-smoke-test.ps1
+
+# Smoke test with end-to-end validation (creates test data)
+.\production-smoke-test.ps1 -SkipEndToEnd:$false
+
+# Continuous monitoring (real-time health checks)
+.\production-monitor.ps1
+
+# Test remote production environment
+.\production-smoke-test.ps1 -ApiUrl "https://api.prod.example.com"
+```
+
+**Features:**
+- ✅ 7 testing phases (Health, RabbitMQ, API, Database, Feature Flags, End-to-End, Performance)
+- ✅ 20+ individual tests with critical/non-critical classification
+- ✅ Automatic alerting on consecutive failures (continuous monitoring)
+- ✅ Incident logging for troubleshooting
+- ✅ Performance checks (response time, queue depth, DLQ size)
+- ✅ Exit codes for CI/CD integration (0=success, 1=failure)
+
+See [scripts/PRODUCTION_TESTS_README.md](scripts/PRODUCTION_TESTS_README.md) for complete documentation.
 
 ### API Endpoints
 
@@ -151,7 +197,10 @@ curl "http://localhost:3000/mailings/{mailingId}/entries?status=FAILED&limit=100
 
 - 🎯 [API Reference](docs/API.md) - Complete REST API documentation with examples
 - 📖 [Architecture](docs/architecture.md) - System architecture and design
-- 🔄 [Checkpointing](docs/CHECKPOINTING.md) - CSV checkpointing and resume capability
+- � **[Rollout Strategy](docs/ROLLOUT_STRATEGY.md)** - Incremental deployment guide with feature flags
+- 📋 **[Rollout Quick Start](docs/ROLLOUT_QUICKSTART.md)** - Quick reference for deployment
+- 📊 **[Rollout Diagrams](docs/ROLLOUT_DIAGRAMS.md)** - Visual deployment flow and architecture
+- �🔄 [Checkpointing](docs/CHECKPOINTING.md) - CSV checkpointing and resume capability
 - 🔁 [Retry Policy](docs/RETRY_POLICY.md) - Email sending retry logic and DLQ
 - 🔧 [Crash Recovery](docs/CRASH_RECOVERY.md) - Automatic recovery of interrupted work
 - 🛑 [Graceful Shutdown](docs/GRACEFUL_SHUTDOWN.md) - Signal handling and clean shutdown
@@ -164,8 +213,10 @@ curl "http://localhost:3000/mailings/{mailingId}/entries?status=FAILED&limit=100
 - 📋 [Implementation Checklist](docs/IMPLEMENTATION_CHECKLIST.md) - Development progress tracking
 - 📁 [Project Organization](docs/PROJECT-ORGANIZATION.md) - Project structure and guidelines
 - ✅ [Reorganization Summary](docs/REORGANIZATION-COMPLETE.md) - Recent reorganization details
-- 🚀 [Docker Guide](docs/DOCKER.md) - Container deployment guide (if exists)
-- 💾 [Database Schema](docs/DATABASE.md) - Database design and migrations (if exists)
+- 📚 **[Step 14 - Documentation Index](docs/STEP14_INDEX.md)** - Complete Step 14 documentation index
+- ✅ **[Step 14 - Acceptance Criteria](docs/STEP14_ACCEPTANCE_CRITERIA.md)** - Complete validation and evidence
+- 🔍 **[Step 14 - Validation Guide](docs/STEP14_VALIDATION_GUIDE.md)** - Quick validation commands
+- 🧪 **[Production Tests](scripts/PRODUCTION_TESTS_README.md)** - Robust smoke tests and continuous monitoring
 
 ## Implementation Details
 
@@ -192,6 +243,8 @@ curl "http://localhost:3000/mailings/{mailingId}/entries?status=FAILED&limit=100
 ✅ **Progress Tracking** - Periodic checkpoints with configurable interval (default: 1000 lines)  
 ✅ **Duplicate Prevention** - Skips duplicates using database constraints and idempotency keys  
 ✅ **Email Validation** - Layered validation (syntax, disposable, MX records)  
+✅ **Outbox Pattern** - Transactional message publishing with reliability guarantees  
+✅ **RabbitMQ Integration** - Durable queues, publisher confirms, dead letter queues  
 ✅ **Worker Pool** - Concurrent email sending with controlled concurrency  
 ✅ **Smart Retry Policy** - Exponential backoff with jitter for transient failures  
 ✅ **Dead Letter Queue** - Permanent failures logged for manual review  
@@ -200,6 +253,9 @@ curl "http://localhost:3000/mailings/{mailingId}/entries?status=FAILED&limit=100
 ✅ **Stale Job Recovery** - Re-queues interrupted work automatically  
 ✅ **Graceful Shutdown** - Handles SIGTERM/SIGINT with proper cleanup  
 ✅ **Signal Handling** - Stops accepting work, drains queue, persists state  
+✅ **Feature Flags** - Enable/disable publisher and consumer for safe rollout  
+✅ **Incremental Rollout** - Canary deployments with monitoring and rollback  
+✅ **Horizontal Scaling** - Multiple consumer replicas with configurable concurrency  
 ✅ **Structured Logging** - JSON logs with all required fields (timestamp, level, mailingId, email, status, etc.)  
 ✅ **Prometheus Metrics** - Complete observability with counters, histograms, and gauges  
 ✅ **Metrics Endpoint** - `/metrics` endpoint for Prometheus scraping  
