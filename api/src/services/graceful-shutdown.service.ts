@@ -14,6 +14,8 @@ import { prisma } from '../config/database.js';
 export interface ShutdownConfig {
   /** Timeout in milliseconds to wait for queue to drain */
   timeout: number;
+  /** Force shutdown timeout in milliseconds (safety net) */
+  forceTimeout: number;
   /** Callback to stop accepting new work */
   onShutdownStart?: () => void | Promise<void>;
   /** Callback to wait for queue to drain */
@@ -77,6 +79,9 @@ export class GracefulShutdownService {
     }
 
     this.isShuttingDown = true;
+
+    // NOW setup force shutdown timeout as safety net
+    this.setupForceShutdownTimeout(this.shutdownConfig.forceTimeout);
 
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`🛑 Graceful Shutdown Initiated (${signal})`);
@@ -246,6 +251,7 @@ export class GracefulShutdownService {
 export function createGracefulShutdown(customConfig?: Partial<ShutdownConfig>): GracefulShutdownService {
   const defaultConfig: ShutdownConfig = {
     timeout: 30000, // 30 seconds default
+    forceTimeout: 60000, // 60 seconds default
     ...customConfig,
   };
 
