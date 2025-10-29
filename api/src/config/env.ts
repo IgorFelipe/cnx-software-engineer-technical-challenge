@@ -26,6 +26,10 @@ interface Config {
   staleSendingThresholdMs: number;
   shutdownTimeoutMs: number;
   forceShutdownTimeoutMs: number;
+  // Feature flags for incremental rollout
+  enableOutboxPublisher: boolean;
+  enableWorkerConsumer: boolean;
+  maxConsumerReplicas: number;
 }
 
 export const config: Config = {
@@ -46,4 +50,8 @@ export const config: Config = {
   staleSendingThresholdMs: parseInt(process.env.STALE_SENDING_THRESHOLD_MS || '300000', 10), // 5 minutes
   shutdownTimeoutMs: parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '30000', 10), // 30 seconds
   forceShutdownTimeoutMs: parseInt(process.env.FORCE_SHUTDOWN_TIMEOUT_MS || '60000', 10), // 60 seconds
+  // Feature flags for incremental rollout
+  enableOutboxPublisher: process.env.ENABLE_OUTBOX_PUBLISHER !== 'false', // default true
+  enableWorkerConsumer: process.env.ENABLE_WORKER_CONSUMER !== 'false', // default true
+  maxConsumerReplicas: parseInt(process.env.MAX_CONSUMER_REPLICAS || '1', 10),
 };

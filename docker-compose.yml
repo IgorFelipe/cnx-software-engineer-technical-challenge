@@ -51,12 +51,23 @@ services:
     ports:
       - '3000:3000'
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_mailing?schema=public
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_mailing?schema=public&connection_limit=25&pool_timeout=30
       RABBITMQ_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
       PORT: 3000
       NODE_ENV: production
       ENABLE_MX_CHECK: 'false'
       ENABLE_DISPOSABLE_CHECK: 'true'
+      ENABLE_OUTBOX_PUBLISHER: 'true'
+      ENABLE_WORKER_CONSUMER: 'false'
+      OUTBOX_POLL_INTERVAL_MS: '30000'
+      SHUTDOWN_TIMEOUT_MS: '10000'
+      FORCE_SHUTDOWN_TIMEOUT_MS: '15000'
+      AUTH_API_URL: 'https://email-test-api-475816.ue.r.appspot.com/auth/token'
+      AUTH_USERNAME: 'cnx_test'
+      AUTH_PASSWORD: 'cnx_password_2025!'
+      EMAIL_API_BASE_URL: 'https://email-test-api-475816.ue.r.appspot.com'
+    volumes:
+      - mailing_storage:/app/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,9 +76,55 @@ services:
     healthcheck:
       test: ['CMD', 'node', '-e', "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
       interval: 30s
-      timeout: 3s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    networks:
+      - email-mailing-network
+
+  worker:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: email-mailing-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_mailing?schema=public&connection_limit=15&pool_timeout=20
+      RABBITMQ_URL: amqp://rabbitmq:rabbitmq@rabbitmq:5672
+      PORT: 3001
+      NODE_ENV: production
+      ENABLE_MX_CHECK: 'false'
+      ENABLE_DISPOSABLE_CHECK: 'true'
+      ENABLE_OUTBOX_PUBLISHER: 'false'
+      ENABLE_WORKER_CONSUMER: 'true'
+      CHECKPOINT_INTERVAL: '1'
+      SHUTDOWN_TIMEOUT_MS: '300000'
+      FORCE_SHUTDOWN_TIMEOUT_MS: '600000'
+      AUTH_API_URL: 'https://email-test-api-475816.ue.r.appspot.com/auth/token'
+      AUTH_USERNAME: 'cnx_test'
+      AUTH_PASSWORD: 'cnx_password_2025!'
+      EMAIL_API_BASE_URL: 'https://email-test-api-475816.ue.r.appspot.com'
+    volumes:
+      - mailing_storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://localhost:3001/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 60s
+      timeout: 10s
       start_period: 40s
-      retries: 3
+      retries: 5
     networks:
       - email-mailing-network
 
@@ -79,4 +136,6 @@ volumes:
   postgres_data:
     driver: local
   rabbitmq_data:
+    driver: local
+  mailing_storage:
     driver: local
