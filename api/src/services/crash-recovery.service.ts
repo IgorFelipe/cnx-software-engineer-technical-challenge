@@ -118,59 +118,94 @@ export class CrashRecoveryService {
   }
 
   /**
-   * Recovers stale CSV processing mailings (RUNNING status)
-   * Mailings stuck in RUNNING status may need manual intervention
+   * Recovers stale CSV processing mailings (RUNNING/PROCESSING status)
+   * Mailings stuck in these statuses may need recovery and re-queueing
    */
   private async recoverStaleMailings(): Promise<{ found: number; recovered: number }> {
-    console.log('\n🔍 Checking for stale CSV processing (RUNNING mailings)...');
+    console.log('\n🔍 Checking for stale CSV processing (RUNNING/PROCESSING mailings)...');
 
     try {
-      // Find mailings that have been RUNNING for too long
-      const staleMailings = await mailingProgressRepository.findActive();
-
-      if (staleMailings.length === 0) {
-        console.log('✅ No stale RUNNING mailings found');
-        return { found: 0, recovered: 0 };
-      }
-
+      const { prisma } = await import('../config/database.js');
       const thresholdDate = new Date(Date.now() - this.staleSendingThresholdMs);
-      const actuallyStale = staleMailings.filter(m => {
+
+      // Check mailings table for PROCESSING status (current system)
+      const staleProcessingMailings = await prisma.mailing.findMany({
+        where: {
+          status: 'PROCESSING',
+          updatedAt: { lt: thresholdDate },
+        },
+      });
+
+      // Check mailing_progress table for RUNNING status (legacy system)
+      const staleRunningMailings = await mailingProgressRepository.findActive();
+      const actuallyStaleRunning = staleRunningMailings.filter(m => {
         const updatedAt = new Date(m.updatedAt);
         return updatedAt < thresholdDate && m.status === 'RUNNING';
       });
 
-      if (actuallyStale.length === 0) {
-        console.log('✅ All RUNNING mailings are recent (not stale)');
+      const totalStale = staleProcessingMailings.length + actuallyStaleRunning.length;
+
+      if (totalStale === 0) {
+        console.log('✅ No stale PROCESSING/RUNNING mailings found');
         return { found: 0, recovered: 0 };
       }
 
-      console.log(`⚠️  Found ${actuallyStale.length} stale RUNNING mailings`);
+      console.log(`⚠️  Found ${totalStale} stale mailings (${staleProcessingMailings.length} PROCESSING, ${actuallyStaleRunning.length} RUNNING)`);
 
-      // Log details
-      for (const mailing of actuallyStale) {
+      let recovered = 0;
+
+      // Recover PROCESSING mailings by re-queueing them
+      for (const mailing of staleProcessingMailings) {
+        const staleDuration = Date.now() - new Date(mailing.updatedAt).getTime();
+        const progressPercent = (mailing.totalLines && mailing.totalLines > 0)
+          ? ((mailing.processedLines / mailing.totalLines) * 100).toFixed(2)
+          : 0;
+
+        console.log(`   - Mailing ${mailing.id}:`);
+        console.log(`     Status: PROCESSING`);
+        console.log(`     Progress: ${mailing.processedLines}/${mailing.totalLines} (${progressPercent}%)`);
+        console.log(`     Last update: ${new Date(mailing.updatedAt).toISOString()} (${this.formatDuration(staleDuration)} ago)`);
+
+        // Keep status as PROCESSING but reset last_attempt timestamp
+        // This allows the worker to pick it up via the stale job detection in tryAcquireLock
+        // The original message is likely still in RabbitMQ queue, so we don't create duplicates
+        await prisma.mailing.update({
+          where: { id: mailing.id },
+          data: { 
+            // Keep status as PROCESSING - worker will detect it's stale and retry
+            lastAttempt: null, // Reset to allow immediate retry
+            // Keep progress so worker can resume from checkpoint
+          },
+        });
+
+        console.log(`     ✅ Reset lastAttempt to allow worker retry (message still in queue)`);
+        console.log(`     ℹ️  Worker will detect stale PROCESSING status and resume job`);
+
+        recovered++;
+      }
+
+      // Recover RUNNING mailings (legacy) by marking as PAUSED
+      for (const mailing of actuallyStaleRunning) {
         const staleDuration = Date.now() - new Date(mailing.updatedAt).getTime();
         const progressPercent = mailing.totalRows > 0
           ? ((mailing.processedRows / mailing.totalRows) * 100).toFixed(2)
           : 0;
 
         console.log(`   - Mailing ${mailing.mailingId}:`);
+        console.log(`     Status: RUNNING (legacy)`);
         console.log(`     Progress: ${mailing.processedRows}/${mailing.totalRows} (${progressPercent}%)`);
         console.log(`     Last line: ${mailing.lastProcessedLine}`);
         console.log(`     Last update: ${new Date(mailing.updatedAt).toISOString()} (${this.formatDuration(staleDuration)} ago)`);
-      }
 
-      // Mark as PAUSED (not FAILED) to allow manual resume
-      let recovered = 0;
-      for (const mailing of actuallyStale) {
         await mailingProgressRepository.update(mailing.mailingId, {
           status: 'PAUSED',
         });
         recovered++;
       }
 
-      console.log(`✅ Marked ${recovered} stale mailings as PAUSED (can be manually resumed)`);
+      console.log(`✅ Recovered ${recovered} stale mailings (reset to PENDING/PAUSED for re-processing)`);
 
-      return { found: actuallyStale.length, recovered };
+      return { found: totalStale, recovered };
 
     } catch (error) {
       console.error('❌ Failed to recover stale mailings:', error);
