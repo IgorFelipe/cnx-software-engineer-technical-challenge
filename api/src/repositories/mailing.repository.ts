@@ -127,6 +127,70 @@ export class MailingRepository {
       data: { processedLines },
     });
   }
+
+  /**
+   * Try to acquire lock on a mailing for processing
+   * Uses conditional UPDATE to prevent race conditions
+   * @param mailingId - Mailing ID
+   * @returns Mailing if lock acquired, null otherwise
+   */
+  async tryAcquireLock(mailingId: string): Promise<Mailing | null> {
+    const staleThreshold = new Date(Date.now() - 30 * 1000); // 30 seconds ago
+    
+    const result = await prisma.$executeRaw`
+      UPDATE mailings
+      SET 
+        status = 'PROCESSING',
+        last_attempt = NOW()
+      WHERE id = ${mailingId}::uuid
+        AND (
+          status IN ('PENDING', 'QUEUED', 'FAILED')
+          OR (status = 'PROCESSING' AND (last_attempt IS NULL OR last_attempt < ${staleThreshold}))
+        )
+    `;
+
+    if (result === 0) {
+      return null;
+    }
+
+    return await prisma.mailing.findUnique({
+      where: { id: mailingId },
+    });
+  }
+
+  /**
+   * Mark mailing as completed
+   * @param mailingId - Mailing ID
+   * @returns Updated mailing
+   */
+  async markCompleted(mailingId: string): Promise<Mailing> {
+    return await prisma.mailing.update({
+      where: { id: mailingId },
+      data: {
+        status: 'COMPLETED',
+        lastAttempt: null,
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  /**
+   * Mark mailing as failed
+   * @param mailingId - Mailing ID
+   * @param errorMessage - Error message
+   * @returns Updated mailing
+   */
+  async markFailed(mailingId: string, errorMessage: string): Promise<Mailing> {
+    return await prisma.mailing.update({
+      where: { id: mailingId },
+      data: {
+        status: 'FAILED',
+        errorMessage,
+        lastAttempt: null,
+        updatedAt: new Date(),
+      },
+    });
+  }
 }
 
 export const mailingRepository = new MailingRepository();

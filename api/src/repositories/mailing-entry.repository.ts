@@ -319,6 +319,103 @@ export class MailingEntryRepository {
       skip: offset,
     });
   }
+
+  /**
+   * Create an invalid email entry
+   * @param mailingId - Mailing ID
+   * @param email - Email address
+   * @param reason - Validation failure reason
+   * @param validationDetails - Detailed validation info
+   * @returns Created entry
+   */
+  async createInvalidEntry(
+    mailingId: string,
+    email: string,
+    reason: string,
+    validationDetails: any
+  ): Promise<any> {
+    const { randomUUID } = await import('crypto');
+    
+    return await prisma.mailingEntry.upsert({
+      where: {
+        unique_mailing_email: {
+          mailingId,
+          email,
+        },
+      },
+      create: {
+        id: randomUUID(),
+        mailingId,
+        email,
+        token: '',
+        status: 'INVALID',
+        invalidReason: reason || 'Unknown',
+        validationDetails: JSON.stringify(validationDetails),
+        updatedAt: new Date(),
+      },
+      update: {
+        status: 'INVALID',
+        invalidReason: reason || 'Unknown',
+        validationDetails: JSON.stringify(validationDetails),
+        updatedAt: new Date(),
+      },
+    });
+  }
+
+  /**
+   * Create or update an email entry after send attempt
+   * @param mailingId - Mailing ID
+   * @param email - Email address
+   * @param token - Verification token
+   * @param status - Email status (SENT/FAILED)
+   * @param externalId - External message ID (if sent)
+   * @param failureReason - Reason for failure (if failed)
+   * @returns Created or updated entry
+   */
+  async upsertEmailResult(
+    mailingId: string,
+    email: string,
+    token: string,
+    status: string,
+    externalId?: string,
+    failureReason?: string
+  ): Promise<any> {
+    const { randomUUID } = await import('crypto');
+    
+    // Truncate failure reason to fit in database column (max 50 chars)
+    const truncatedReason = failureReason ? failureReason.substring(0, 50) : null;
+    
+    return await prisma.mailingEntry.upsert({
+      where: {
+        unique_mailing_email: {
+          mailingId,
+          email,
+        },
+      },
+      create: {
+        id: randomUUID(),
+        mailingId,
+        email,
+        token,
+        status,
+        attempts: 1,
+        lastAttempt: new Date(),
+        externalId,
+        invalidReason: status === 'FAILED' ? truncatedReason : null,
+        validationDetails: status === 'FAILED' && failureReason ? JSON.stringify({ error: failureReason }) : null,
+        updatedAt: new Date(),
+      },
+      update: {
+        status,
+        attempts: { increment: 1 },
+        lastAttempt: new Date(),
+        externalId,
+        invalidReason: status === 'FAILED' ? truncatedReason : null,
+        validationDetails: status === 'FAILED' && failureReason ? JSON.stringify({ error: failureReason }) : null,
+        updatedAt: new Date(),
+      },
+    });
+  }
 }
 
 export const mailingEntryRepository = new MailingEntryRepository();

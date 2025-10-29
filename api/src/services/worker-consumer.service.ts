@@ -4,7 +4,10 @@ import { rabbitmqTopologyService } from './rabbitmq-topology.service.js';
 import { emailValidationService } from './email-validation.service.js';
 import { EmailTestApiProvider } from '../providers/email-test-api.provider.js';
 import { logger } from './logger.service.js';
-import { prisma } from '../config/database.js';
+import { VerificationTokenService } from './verification-token.service.js';
+import { mailingRepository } from '../repositories/mailing.repository.js';
+import { mailingEntryRepository } from '../repositories/mailing-entry.repository.js';
+import { deadLetterRepository } from '../repositories/dead-letter.repository.js';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -131,14 +134,7 @@ export class WorkerConsumerService {
 
       if (result.success) {
         // Mark as completed
-        await prisma.mailing.update({
-          where: { id: mailingId },
-          data: {
-            status: 'COMPLETED',
-            processedLines: result.processedLines,
-            updatedAt: new Date(),
-          },
-        });
+        await mailingRepository.markCompleted(mailingId);
 
         logger.info(`✅ Job ${mailingId} completed successfully`);
         logger.info(`   Processed: ${result.processedLines} lines`);
@@ -186,22 +182,8 @@ export class WorkerConsumerService {
    *   - OR last_attempt is older than 30 seconds (stale job)
    */
   private async tryAcquireLock(mailingId: string): Promise<boolean> {
-    // Calculate threshold for detecting stale PROCESSING jobs (30 seconds ago)
-    const staleThreshold = new Date(Date.now() - 30000);
-    
-    const result = await prisma.$executeRaw`
-      UPDATE mailings
-      SET status = 'PROCESSING',
-          attempts = attempts + 1,
-          last_attempt = NOW()
-      WHERE id = ${mailingId}::uuid
-        AND (
-          status IN ('PENDING', 'QUEUED', 'FAILED')
-          OR (status = 'PROCESSING' AND (last_attempt IS NULL OR last_attempt < ${staleThreshold}))
-        )
-    `;
-
-    return result > 0;
+    const mailing = await mailingRepository.tryAcquireLock(mailingId);
+    return mailing !== null;
   }
 
   /**
@@ -248,18 +230,12 @@ export class WorkerConsumerService {
       const totalLines = rows.length;
 
       // Get current progress from database (for crash recovery)
-      const mailing = await prisma.mailing.findUnique({
-        where: { id: mailingId },
-        select: { processedLines: true },
-      });
+      const mailing = await mailingRepository.findById(mailingId);
 
       const alreadyProcessed = mailing?.processedLines || 0;
       processedLines = alreadyProcessed; // Start from where we left off
 
-      await prisma.mailing.update({
-        where: { id: mailingId },
-        data: { totalLines },
-      });
+      await mailingRepository.update(mailingId, { totalLines });
 
       if (alreadyProcessed > 0) {
         logger.info(`🔄 Resuming from checkpoint: ${alreadyProcessed}/${totalLines} lines already processed`);
@@ -295,42 +271,26 @@ export class WorkerConsumerService {
             logger.warn(`⚠️  Line ${i + 1}: Invalid email ${email} - ${validation.reason}`);
             
             // Save invalid email entry to database
-            const { randomUUID } = await import('crypto');
-            await prisma.mailingEntry.upsert({
-              where: {
-                unique_mailing_email: {
-                  mailingId,
-                  email,
-                },
-              },
-              create: {
-                id: randomUUID(),
-                mailingId,
-                email,
-                token: '',
-                status: 'INVALID',
-                invalidReason: validation.reason || 'Unknown',
-                validationDetails: JSON.stringify(validation),
-                updatedAt: new Date(),
-              },
-              update: {
-                status: 'INVALID',
-                invalidReason: validation.reason || 'Unknown',
-                validationDetails: JSON.stringify(validation),
-                updatedAt: new Date(),
-              },
-            });
+            await mailingEntryRepository.createInvalidEntry(
+              mailingId,
+              email,
+              validation.reason || 'Unknown',
+              validation
+            );
             
             failedCount++;
             continue;
           }
 
-          // Generate unique token and idempotency key
-          const token = crypto.randomBytes(16).toString('hex');
+          // Generate unique internal token for idempotency
+          const internalToken = crypto.randomBytes(16).toString('hex');
           const idempotencyKey = crypto
             .createHash('sha256')
-            .update(`${mailingId}-${email}-${token}`)
+            .update(`${mailingId}-${email}-${internalToken}`)
             .digest('hex');
+
+          // Generate verification token for the user
+          const verificationToken = VerificationTokenService.generateAlphanumericToken(8);
 
           // Send email (rate limiting is handled internally by emailProvider)
           let emailStatus = 'PENDING';
@@ -342,12 +302,23 @@ export class WorkerConsumerService {
           // Retry loop for rate limit errors
           while (retryAttempt <= maxRetries) {
             try {
-              const result = await emailProvider.sendEmail({
+              const emailPayload = {
                 to: email,
-                subject: `Your mailing token`,
-                body: `Hello! Your token is: ${token}`,
+                subject: 'Complete your registration',
+                body: `Thank you for signing up. Please verify your token ${verificationToken} to continue.`,
                 idempotencyKey,
-              });
+              };
+              
+              // Log the email payload being sent
+              logger.info(`📤 Sending email payload: ${JSON.stringify({
+                to: emailPayload.to,
+                subject: emailPayload.subject,
+                body: emailPayload.body,
+                token: verificationToken,
+                idempotencyKey: emailPayload.idempotencyKey.substring(0, 16) + '...'
+              })}`);
+              
+              const result = await emailProvider.sendEmail(emailPayload);
 
               if (result.success) {
                 sentCount++;
@@ -380,50 +351,19 @@ export class WorkerConsumerService {
               break;
             }
           }
-
-          // Save email entry to database
-          const { randomUUID } = await import('crypto');
-          
-          // Truncate failure reason to fit in database column (max 50 chars)
-          const truncatedReason = failureReason ? failureReason.substring(0, 50) : null;
-          
-          await prisma.mailingEntry.upsert({
-            where: {
-              unique_mailing_email: {
-                mailingId,
-                email,
-              },
-            },
-            create: {
-              id: randomUUID(),
-              mailingId,
-              email,
-              token,
-              status: emailStatus,
-              attempts: 1,
-              lastAttempt: new Date(),
-              externalId,
-              invalidReason: emailStatus === 'FAILED' ? truncatedReason : null,
-              validationDetails: emailStatus === 'FAILED' && failureReason ? JSON.stringify({ error: failureReason }) : null,
-              updatedAt: new Date(),
-            },
-            update: {
-              status: emailStatus,
-              attempts: { increment: 1 },
-              lastAttempt: new Date(),
-              externalId,
-              invalidReason: emailStatus === 'FAILED' ? truncatedReason : null,
-              validationDetails: emailStatus === 'FAILED' && failureReason ? JSON.stringify({ error: failureReason }) : null,
-              updatedAt: new Date(),
-            },
-          });
+          // Save email result to database
+          await mailingEntryRepository.upsertEmailResult(
+            mailingId,
+            email,
+            verificationToken,
+            emailStatus,
+            externalId,
+            failureReason
+          );
 
           // Checkpoint progress
           if (processedLines % this.CHECKPOINT_INTERVAL === 0) {
-            await prisma.mailing.update({
-              where: { id: mailingId },
-              data: { processedLines },
-            });
+            await mailingRepository.updateProgress(mailingId, processedLines);
             logger.info(`📍 Checkpoint: ${processedLines}/${totalLines} lines processed`);
           }
         } catch (lineError) {
@@ -433,10 +373,7 @@ export class WorkerConsumerService {
       }
 
       // Final checkpoint
-      await prisma.mailing.update({
-        where: { id: mailingId },
-        data: { processedLines },
-      });
+      await mailingRepository.updateProgress(mailingId, processedLines);
 
       // Check failure threshold
       const failureRate = failedCount / totalLines;
@@ -461,14 +398,10 @@ export class WorkerConsumerService {
       logger.error(`❌ Error processing CSV: ${error instanceof Error ? error.message : 'Unknown error'}`);
       
       // Update mailing with error
-      await prisma.mailing.update({
-        where: { id: mailingId },
-        data: {
-          status: 'FAILED',
-          errorMessage: error instanceof Error ? error.message : 'Unknown error',
-          processedLines,
-        },
-      }).catch((e: any) => logger.error(`Failed to update mailing: ${e}`));
+      await mailingRepository.markFailed(
+        mailingId,
+        error instanceof Error ? error.message : 'Unknown error'
+      ).catch((e: any) => logger.error(`Failed to update mailing: ${e}`));
 
       return {
         success: false,
@@ -501,15 +434,11 @@ export class WorkerConsumerService {
     
     try {
       // 1. Update mailings.attempts in database
-      await prisma.mailing.update({
-        where: { id: mailingId },
-        data: {
-          attempts: nextAttempt,
-          lastAttempt: new Date(),
-          status: 'FAILED', // Mark as FAILED while waiting for retry
-          errorMessage: error || 'Processing failed, will retry',
-          updatedAt: new Date(),
-        },
+      await mailingRepository.update(mailingId, {
+        attempts: nextAttempt,
+        lastAttempt: new Date(),
+        status: 'FAILED', // Mark as FAILED while waiting for retry
+        errorMessage: error || 'Processing failed, will retry',
       });
 
       logger.info(`📝 Updated mailing attempts: ${nextAttempt}/${this.MAX_RETRY_ATTEMPTS}`);
@@ -555,27 +484,21 @@ export class WorkerConsumerService {
 
     try {
       // 1. Insert into dead_letters table for audit
-      await prisma.deadLetter.create({
-        data: {
-          mailingId,
-          email: filename, // Using filename as identifier (not individual email)
-          reason: error || 'Max retry attempts exceeded',
-          attempts: this.MAX_RETRY_ATTEMPTS,
-          lastError: error || 'Unknown error',
-        },
+      await deadLetterRepository.create({
+        mailingId,
+        email: filename, // Using filename as identifier (not individual email)
+        reason: error || 'Max retry attempts exceeded',
+        attempts: this.MAX_RETRY_ATTEMPTS,
+        lastError: error || 'Unknown error',
       });
 
       logger.info(`📝 Inserted into dead_letters table: ${mailingId}`);
 
       // 2. Update mailing status to FAILED
-      await prisma.mailing.update({
-        where: { id: mailingId },
-        data: {
-          status: 'FAILED',
-          errorMessage: error || 'Max retry attempts exceeded',
-          updatedAt: new Date(),
-        },
-      });
+      await mailingRepository.markFailed(
+        mailingId,
+        error || 'Max retry attempts exceeded'
+      );
 
       // 3. Publish to DLQ for manual inspection
       const dlqPayload = {
