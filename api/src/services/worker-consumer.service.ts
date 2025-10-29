@@ -2,7 +2,6 @@ import type { Channel, ConsumeMessage } from 'amqplib';
 import { rabbitmqService } from './rabbitmq.service.js';
 import { rabbitmqTopologyService } from './rabbitmq-topology.service.js';
 import { emailValidationService } from './email-validation.service.js';
-import { getRateLimiter } from './rate-limiter.service.js';
 import { EmailTestApiProvider } from '../providers/email-test-api.provider.js';
 import { logger } from './logger.service.js';
 import { prisma } from '../config/database.js';
@@ -179,15 +178,27 @@ export class WorkerConsumerService {
   /**
    * Tries to acquire processing lock via conditional UPDATE
    * Returns true if lock acquired, false if already locked
+   * 
+   * Crash Recovery Handling:
+   * - Accepts jobs in PENDING, QUEUED, or FAILED status (normal flow)
+   * - Also accepts jobs in PROCESSING status if:
+   *   - last_attempt is NULL (crash recovery reset it)
+   *   - OR last_attempt is older than 30 seconds (stale job)
    */
   private async tryAcquireLock(mailingId: string): Promise<boolean> {
+    // Calculate threshold for detecting stale PROCESSING jobs (30 seconds ago)
+    const staleThreshold = new Date(Date.now() - 30000);
+    
     const result = await prisma.$executeRaw`
       UPDATE mailings
       SET status = 'PROCESSING',
           attempts = attempts + 1,
           last_attempt = NOW()
       WHERE id = ${mailingId}::uuid
-        AND status IN ('PENDING', 'QUEUED', 'FAILED')
+        AND (
+          status IN ('PENDING', 'QUEUED', 'FAILED')
+          OR (status = 'PROCESSING' AND (last_attempt IS NULL OR last_attempt < ${staleThreshold}))
+        )
     `;
 
     return result > 0;
@@ -236,20 +247,34 @@ export class WorkerConsumerService {
 
       const totalLines = rows.length;
 
+      // Get current progress from database (for crash recovery)
+      const mailing = await prisma.mailing.findUnique({
+        where: { id: mailingId },
+        select: { processedLines: true },
+      });
+
+      const alreadyProcessed = mailing?.processedLines || 0;
+      processedLines = alreadyProcessed; // Start from where we left off
+
       await prisma.mailing.update({
         where: { id: mailingId },
         data: { totalLines },
       });
 
+      if (alreadyProcessed > 0) {
+        logger.info(`🔄 Resuming from checkpoint: ${alreadyProcessed}/${totalLines} lines already processed`);
+      }
       logger.info(`📊 Total lines: ${totalLines}`);
 
-      // Get rate limiter instance
-      const rateLimiter = getRateLimiter();
-
-      // 3. Process each line
-      for (let i = 0; i < rows.length; i++) {
+      // 3. Process each line (skip already processed lines)
+      for (let i = alreadyProcessed; i < rows.length; i++) {
         const row = rows[i];
         processedLines++;
+
+        // Yield to event loop every 10 iterations to prevent blocking
+        if (i > 0 && i % 10 === 0) {
+          await new Promise(resolve => setImmediate(resolve));
+        }
 
         try {
           const email = row.email?.trim();
@@ -268,6 +293,34 @@ export class WorkerConsumerService {
 
           if (!validation.isValid) {
             logger.warn(`⚠️  Line ${i + 1}: Invalid email ${email} - ${validation.reason}`);
+            
+            // Save invalid email entry to database
+            const { randomUUID } = await import('crypto');
+            await prisma.mailingEntry.upsert({
+              where: {
+                unique_mailing_email: {
+                  mailingId,
+                  email,
+                },
+              },
+              create: {
+                id: randomUUID(),
+                mailingId,
+                email,
+                token: '',
+                status: 'INVALID',
+                invalidReason: validation.reason || 'Unknown',
+                validationDetails: JSON.stringify(validation),
+                updatedAt: new Date(),
+              },
+              update: {
+                status: 'INVALID',
+                invalidReason: validation.reason || 'Unknown',
+                validationDetails: JSON.stringify(validation),
+                updatedAt: new Date(),
+              },
+            });
+            
             failedCount++;
             continue;
           }
@@ -279,8 +332,15 @@ export class WorkerConsumerService {
             .update(`${mailingId}-${email}-${token}`)
             .digest('hex');
 
-          // Send email with rate limiting
-          await rateLimiter.schedule(async () => {
+          // Send email (rate limiting is handled internally by emailProvider)
+          let emailStatus = 'PENDING';
+          let externalId: string | undefined;
+          let failureReason: string | undefined;
+          let retryAttempt = 0;
+          const maxRetries = 3;
+          
+          // Retry loop for rate limit errors
+          while (retryAttempt <= maxRetries) {
             try {
               const result = await emailProvider.sendEmail({
                 to: email,
@@ -291,16 +351,72 @@ export class WorkerConsumerService {
 
               if (result.success) {
                 sentCount++;
+                emailStatus = 'SENT';
+                externalId = result.messageId;
                 logger.debug(`✉️  Sent email to ${email} (message_id: ${result.messageId})`);
+                break; // Success, exit retry loop
               } else {
+                // Check if it's a rate limit error (429)
+                if (result.statusCode === 429 && retryAttempt < maxRetries) {
+                  retryAttempt++;
+                  const waitTime = Math.pow(2, retryAttempt) * 1000; // Exponential backoff: 2s, 4s, 8s
+                  logger.warn(`⏳ Rate limit hit for ${email}, retrying in ${waitTime}ms (attempt ${retryAttempt}/${maxRetries})`);
+                  await new Promise(resolve => setTimeout(resolve, waitTime));
+                  continue; // Retry
+                }
+                
+                // Other errors or max retries reached
                 failedCount++;
-                logger.warn(`❌ Failed to send to ${email}: ${result.error}`);
+                emailStatus = 'FAILED';
+                failureReason = result.error || 'Unknown error';
+                logger.warn(`❌ Failed to send to ${email}: ${result.error} (status: ${result.statusCode})`);
+                break;
               }
             } catch (sendError) {
               failedCount++;
+              emailStatus = 'FAILED';
+              failureReason = sendError instanceof Error ? sendError.message : 'Unknown error';
               logger.error(`❌ Error sending to ${email}: ${sendError instanceof Error ? sendError.message : 'Unknown'}`);
+              break;
             }
-          }, 5); // Normal priority
+          }
+
+          // Save email entry to database
+          const { randomUUID } = await import('crypto');
+          
+          // Truncate failure reason to fit in database column (max 50 chars)
+          const truncatedReason = failureReason ? failureReason.substring(0, 50) : null;
+          
+          await prisma.mailingEntry.upsert({
+            where: {
+              unique_mailing_email: {
+                mailingId,
+                email,
+              },
+            },
+            create: {
+              id: randomUUID(),
+              mailingId,
+              email,
+              token,
+              status: emailStatus,
+              attempts: 1,
+              lastAttempt: new Date(),
+              externalId,
+              invalidReason: emailStatus === 'FAILED' ? truncatedReason : null,
+              validationDetails: emailStatus === 'FAILED' && failureReason ? JSON.stringify({ error: failureReason }) : null,
+              updatedAt: new Date(),
+            },
+            update: {
+              status: emailStatus,
+              attempts: { increment: 1 },
+              lastAttempt: new Date(),
+              externalId,
+              invalidReason: emailStatus === 'FAILED' ? truncatedReason : null,
+              validationDetails: emailStatus === 'FAILED' && failureReason ? JSON.stringify({ error: failureReason }) : null,
+              updatedAt: new Date(),
+            },
+          });
 
           // Checkpoint progress
           if (processedLines % this.CHECKPOINT_INTERVAL === 0) {
