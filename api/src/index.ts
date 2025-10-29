@@ -32,22 +32,38 @@ const fastify = Fastify({
 // Start server
 const start = async () => {
   try {
-    // Register plugins and routes in correct order
-    console.log('⚙️  Configuring Fastify...\n');
+    const isWorker = config.enableWorkerConsumer && !config.enableOutboxPublisher;
+    const isApi = !config.enableWorkerConsumer && config.enableOutboxPublisher;
     
-    // 1. Register multipart plugin FIRST (needed by routes)
-    console.log('📦 Registering multipart plugin...');
-    await fastify.register(multipart, {
-      limits: {
-        fileSize: 100 * 1024 * 1024, // 100MB max file size
-      },
-    });
-    console.log('✅ Multipart plugin registered\n');
+    console.log('⚙️  Starting application...');
+    console.log(`   enableWorkerConsumer: ${config.enableWorkerConsumer}`);
+    console.log(`   enableOutboxPublisher: ${config.enableOutboxPublisher}`);
+    console.log(`   isWorker: ${isWorker}`);
+    console.log(`   isApi: ${isApi}`);
+    console.log(`   Mode: ${isWorker ? 'WORKER' : isApi ? 'API' : 'HYBRID'}`);
+    console.log('');
+    
+    // Register plugins and routes only for API mode
+    if (!isWorker) {
+      console.log('⚙️  Configuring Fastify...\n');
+      
+      // 1. Register multipart plugin FIRST (needed by routes)
+      console.log('📦 Registering multipart plugin...');
+      await fastify.register(multipart, {
+        limits: {
+          fileSize: 100 * 1024 * 1024, // 100MB max file size
+        },
+      });
+      console.log('✅ Multipart plugin registered\n');
 
-    // 2. Register application routes BEFORE Swagger (so Swagger can document them)
-    console.log('�️  Registering application routes...');
-    await fastify.register(mailingRoutes);
-    console.log('✅ Mailing routes registered\n');
+      // 2. Register application routes BEFORE Swagger (so Swagger can document them)
+      console.log('🛣️  Registering application routes...');
+      await fastify.register(mailingRoutes);
+      console.log('✅ Mailing routes registered\n');
+    } else {
+      // Worker mode: minimal Fastify setup (health check only)
+      console.log('⚙️  Worker mode - minimal Fastify (health check only)...\n');
+    }
     
     // 3. Register hooks and endpoints
     console.log('🔧 Registering hooks and endpoints...');
@@ -155,21 +171,26 @@ const start = async () => {
         fastify.log.error({ error }, 'Database health check failed');
       }
 
-      // Check TokenManager status
-      try {
-        const { getTokenManager } = await import('./services/token-manager.service.js');
-        const manager = getTokenManager();
-        const metricsData = manager.getMetrics();
-        
-        health.tokenManager.status = 'initialized';
-        health.tokenManager.hasToken = metricsData.currentTokenExpiresAt !== null;
-        health.tokenManager.expiresAt = metricsData.currentTokenExpiresAt 
-          ? new Date(metricsData.currentTokenExpiresAt).toISOString() 
-          : null;
-      } catch (error) {
-        health.status = 'degraded';
-        health.tokenManager.status = 'not_initialized';
-        fastify.log.error({ error }, 'TokenManager health check failed');
+      // Check TokenManager status (only in Worker mode)
+      if (isWorker) {
+        try {
+          const { getTokenManager } = await import('./services/token-manager.service.js');
+          const manager = getTokenManager();
+          const metricsData = manager.getMetrics();
+          
+          health.tokenManager.status = 'initialized';
+          health.tokenManager.hasToken = metricsData.currentTokenExpiresAt !== null;
+          health.tokenManager.expiresAt = metricsData.currentTokenExpiresAt 
+            ? new Date(metricsData.currentTokenExpiresAt).toISOString() 
+            : null;
+        } catch (error) {
+          health.status = 'degraded';
+          health.tokenManager.status = 'not_initialized';
+          fastify.log.error({ error }, 'TokenManager health check failed');
+        }
+      } else {
+        // API mode doesn't need TokenManager
+        health.tokenManager.status = 'not_applicable';
       }
 
       const statusCode = health.status === 'ok' ? 200 : 503;
@@ -210,9 +231,10 @@ const start = async () => {
     
     console.log('✅ Hooks and endpoints registered\n');
 
-    // 4. NOW register Swagger/SwaggerUI LAST (after routes are registered)
-    console.log('� Registering Swagger documentation...');
-    await fastify.register(swagger, {
+    // 4. NOW register Swagger/SwaggerUI LAST (after routes are registered) - API only
+    if (!isWorker) {
+      console.log('📘 Registering Swagger documentation...');
+      await fastify.register(swagger, {
       openapi: {
         info: {
           title: 'Email Mailing Service API',
@@ -351,71 +373,98 @@ const start = async () => {
       transformSpecificationClone: true
     });
     console.log('✅ Swagger documentation registered\n');
+    } else {
+      console.log('⏭️  Skipping Swagger (Worker mode)\n');
+    }
     
     // Log all registered routes for debugging
-    console.log('📋 Registered routes:');
-    console.log(fastify.printRoutes({ commonPrefix: false }));
-    console.log('');
+    if (!isWorker) {
+      console.log('📋 Registered routes:');
+      console.log(fastify.printRoutes({ commonPrefix: false }));
+      console.log('');
+    }
 
-    // Run crash recovery on boot
-    console.log('🔄 Running crash recovery check...');
-    await crashRecoveryService.recoverOnBoot();
-    console.log('✅ Crash recovery complete\n');
+    // Run crash recovery on boot (Worker only - API doesn't process jobs)
+    if (isWorker) {
+      console.log('🔄 Running crash recovery check...');
+      await crashRecoveryService.recoverOnBoot();
+      console.log('✅ Crash recovery complete\n');
+    }
 
-    // Initialize TokenManager (required for email sending)
-    console.log('🔐 Initializing TokenManager...');
-    initializeTokenManager({
-      authUrl: config.authApiUrl,
-      username: config.authUsername,
-      password: config.authPassword,
-      renewalWindowMs: 5 * 60 * 1000, // 5 minutes before expiry
-    });
-    console.log('✅ TokenManager initialized');
+    // Initialize TokenManager (Worker only - required for email sending)
+    if (isWorker) {
+      console.log('🔐 Initializing TokenManager...');
+      initializeTokenManager({
+        authUrl: config.authApiUrl,
+        username: config.authUsername,
+        password: config.authPassword,
+        renewalWindowMs: 5 * 60 * 1000, // 5 minutes before expiry
+      });
+      console.log('✅ TokenManager initialized');
+    }
 
-    // Initialize RateLimiter (required for API rate limiting)
-    console.log('⏱️  Initializing RateLimiter...');
-    initializeRateLimiter({
-      rateLimitPerMinute: config.rateLimitPerMinute,
-      workerConcurrency: config.workerConcurrency,
-    });
-    const { getRateLimiter } = await import('./services/rate-limiter.service.js');
-    const rateLimiter = getRateLimiter();
-    console.log('✅ RateLimiter initialized\n');
+    // Initialize RateLimiter (Worker only - required for email rate limiting)
+    let rateLimiter: any = null;
+    if (isWorker) {
+      console.log('⏱️  Initializing RateLimiter...');
+      initializeRateLimiter({
+        rateLimitPerMinute: config.rateLimitPerMinute,
+        workerConcurrency: config.workerConcurrency,
+      });
+      const { getRateLimiter } = await import('./services/rate-limiter.service.js');
+      rateLimiter = getRateLimiter();
+      console.log('✅ RateLimiter initialized\n');
+    }
 
     // Start Outbox Publisher (background service for reliable message publishing)
-    console.log('📬 Starting Outbox Publisher...');
-    await outboxPublisher.start();
-    console.log('✅ Outbox Publisher started\n');
+    if (config.enableOutboxPublisher) {
+      console.log('📬 Starting Outbox Publisher...');
+      await outboxPublisher.start();
+      console.log('✅ Outbox Publisher started\n');
+    } else {
+      console.log('⏭️  Outbox Publisher DISABLED by feature flag\n');
+    }
 
     // Start Worker Consumer (processes mailing jobs from RabbitMQ)
-    console.log('👷 Starting Worker Consumer...');
-    await workerConsumerService.start();
-    console.log('✅ Worker Consumer started\n');
+    if (config.enableWorkerConsumer) {
+      console.log('👷 Starting Worker Consumer...');
+      await workerConsumerService.start();
+      console.log('✅ Worker Consumer started\n');
+    } else {
+      console.log('⏭️  Worker Consumer DISABLED by feature flag\n');
+    }
 
     // Setup graceful shutdown
     const gracefulShutdown = createGracefulShutdown({
       timeout: config.shutdownTimeoutMs,
+      forceTimeout: config.forceShutdownTimeoutMs,
       
       onShutdownStart: async () => {
         console.log('🛑 Stopping acceptance of new mailing requests...');
         isAcceptingNewWork = false;
 
         // Stop Worker Consumer first (stop consuming new jobs)
-        console.log('👷 Stopping Worker Consumer...');
-        await workerConsumerService.stop();
+        if (config.enableWorkerConsumer) {
+          console.log('👷 Stopping Worker Consumer...');
+          await workerConsumerService.stop();
+        }
 
         // Stop Outbox Publisher
-        console.log('📪 Stopping Outbox Publisher...');
-        await outboxPublisher.stop();
+        if (config.enableOutboxPublisher) {
+          console.log('📪 Stopping Outbox Publisher...');
+          await outboxPublisher.stop();
+        }
         
         // Stop Fastify from accepting new connections
         await fastify.close();
       },
       
       onWaitForQueue: async () => {
-        console.log('⏳ Waiting for rate limiter queue to drain...');
-        await rateLimiter.waitForIdle();
-        console.log('✅ Rate limiter queue is idle');
+        if (rateLimiter) {
+          console.log('⏳ Waiting for rate limiter queue to drain...');
+          await rateLimiter.waitForIdle();
+          console.log('✅ Rate limiter queue is idle');
+        }
       },
       
       onPersistState: async () => {
@@ -434,8 +483,8 @@ const start = async () => {
     // Register signal handlers
     gracefulShutdown.registerHandlers();
     
-    // Setup force shutdown timeout as safety net
-    gracefulShutdown.setupForceShutdownTimeout(config.forceShutdownTimeoutMs);
+    // Force shutdown timeout is now setup ONLY when shutdown is triggered
+    // gracefulShutdown.setupForceShutdownTimeout(config.forceShutdownTimeoutMs);
 
     // Ensure all plugins are ready before listening
     console.log('⏳ Waiting for Fastify to be ready...');
